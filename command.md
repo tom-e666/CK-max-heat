@@ -1,0 +1,1 @@
+python.exe train.py --device cuda --epochs 30 --batch-size 16 --num-workers 4 --lr 0.001
