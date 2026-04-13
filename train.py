@@ -73,6 +73,52 @@ def kl_to_uniform(ambiguity_probs: torch.Tensor, mask: torch.Tensor) -> torch.Te
 	return (selected * (selected.log() - math.log(1.0 / num_classes))).sum(dim=1).mean()
 
 
+def compute_confusion_matrices(
+	y_true: np.ndarray,
+	y_pred: np.ndarray,
+	num_classes: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Return multiclass confusion matrix and one-vs-rest multilabel confusion matrices."""
+	cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+	for true_idx, pred_idx in zip(y_true, y_pred):
+		cm[int(true_idx), int(pred_idx)] += 1
+
+	ml_cm = np.zeros((num_classes, 2, 2), dtype=np.int64)
+	for cls_idx in range(num_classes):
+		true_mask = y_true == cls_idx
+		pred_mask = y_pred == cls_idx
+		tp = int(np.logical_and(true_mask, pred_mask).sum())
+		fn = int(np.logical_and(true_mask, np.logical_not(pred_mask)).sum())
+		fp = int(np.logical_and(np.logical_not(true_mask), pred_mask).sum())
+		tn = int(np.logical_and(np.logical_not(true_mask), np.logical_not(pred_mask)).sum())
+		ml_cm[cls_idx] = np.array([[tn, fp], [fn, tp]], dtype=np.int64)
+
+	return cm, ml_cm
+
+
+@torch.no_grad()
+def collect_predictions(
+	model: nn.Module,
+	loader: DataLoader,
+	device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""Collect predictions and labels for confusion-matrix style reports."""
+	model.eval()
+	all_preds = []
+	all_labels = []
+
+	for images, labels in loader:
+		images = images.to(device)
+		outputs = model(images)
+		logits = outputs["logits"]
+		preds = logits.argmax(dim=1)
+
+		all_preds.append(preds.detach().cpu().numpy())
+		all_labels.append(labels.detach().cpu().numpy())
+
+	return np.concatenate(all_labels), np.concatenate(all_preds)
+
+
 class CKExtendedDataset(Dataset):
 	def __init__(self, dataframe: pd.DataFrame, label_to_idx: Optional[Dict[int, int]] = None):
 		self.dataframe = dataframe.reset_index(drop=True)
@@ -175,6 +221,7 @@ def train_one_epoch(
 	push_scale: float,
 	lambda_ae: float,
 	lambda_push: float,
+	aux_scale: float,
 	epoch: int = 1,
 	total_epochs: int = 1,
 ) -> Tuple[float, float]:
@@ -236,7 +283,7 @@ def train_one_epoch(
 			loss_push = logits_clean.new_zeros(())
 
 		loss_ae = kl_to_uniform(outputs["ambiguity_probs"], boundary_mask)
-		loss = loss_clean + (lambda_push * loss_push) + (lambda_ae * loss_ae)
+		loss = loss_clean + (aux_scale * lambda_push * loss_push) + (aux_scale * lambda_ae * loss_ae)
 		loss.backward()
 		optimizer.step()
 
@@ -330,6 +377,7 @@ def run(args: argparse.Namespace) -> None:
 		pin_memory=(device.type == "cuda"),
 		return_label_map=True,
 	)
+	idx_to_label = {idx: raw_label for raw_label, idx in label_to_idx.items()}
 
 	if "train" not in loaders:
 		raise ValueError("Training split not found in CSV (Usage == 'Training').")
@@ -352,6 +400,12 @@ def run(args: argparse.Namespace) -> None:
 
 	best_val_acc = -1.0
 	for epoch in range(1, args.epochs + 1):
+		if epoch < args.aux_start_epoch:
+			aux_scale = 0.0
+		else:
+			ramp_progress = (epoch - args.aux_start_epoch + 1) / max(args.aux_ramp_epochs, 1)
+			aux_scale = min(1.0, max(0.0, ramp_progress))
+
 		train_loss, train_acc = train_one_epoch(
 			model,
 			loaders["train"],
@@ -365,6 +419,7 @@ def run(args: argparse.Namespace) -> None:
 			push_scale=args.push_scale,
 			lambda_ae=args.lambda_ae,
 			lambda_push=args.lambda_push,
+			aux_scale=aux_scale,
 			epoch=epoch,
 			total_epochs=args.epochs,
 		)
@@ -396,6 +451,25 @@ def run(args: argparse.Namespace) -> None:
 		print(test_msg)
 		logger.info(test_msg)
 
+		if args.print_confusion or args.print_multilabel_confusion:
+			y_true, y_pred = collect_predictions(model, loaders["test"], device)
+			cm, ml_cm = compute_confusion_matrices(y_true, y_pred, inferred_num_classes)
+
+			if args.print_confusion:
+				cm_text = np.array2string(cm, separator=", ")
+				print("Confusion matrix (rows=true, cols=pred):")
+				print(cm_text)
+				logger.info("confusion_matrix:\n%s", cm_text)
+
+			if args.print_multilabel_confusion:
+				print("Multilabel confusion matrices (one-vs-rest, format [[TN, FP], [FN, TP]]):")
+				for cls_idx in range(inferred_num_classes):
+					label_name = idx_to_label.get(cls_idx, cls_idx)
+					cls_text = np.array2string(ml_cm[cls_idx], separator=", ")
+					line = f"class={label_name} idx={cls_idx} matrix={cls_text}"
+					print(line)
+					logger.info("multilabel_confusion | %s", line)
+
 	logger.info("finish training")
 
 
@@ -414,6 +488,10 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--push-scale", type=float, default=0.5)
 	parser.add_argument("--lambda-ae", type=float, default=0.02)
 	parser.add_argument("--lambda-push", type=float, default=0.25)
+	parser.add_argument("--aux-start-epoch", type=int, default=4)
+	parser.add_argument("--aux-ramp-epochs", type=int, default=6)
+	parser.add_argument("--print-confusion", action="store_true")
+	parser.add_argument("--print-multilabel-confusion", action="store_true")
 	parser.add_argument("--save", type=str, default="best_model.pt")
 	parser.add_argument("--log-file", type=str, default="train.log")
 	parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default="auto")
