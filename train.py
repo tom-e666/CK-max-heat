@@ -120,9 +120,15 @@ def collect_predictions(
 
 
 class CKExtendedDataset(Dataset):
-	def __init__(self, dataframe: pd.DataFrame, label_to_idx: Optional[Dict[int, int]] = None):
+	def __init__(
+		self,
+		dataframe: pd.DataFrame,
+		label_to_idx: Optional[Dict[int, int]] = None,
+		augment: bool = False,
+	):
 		self.dataframe = dataframe.reset_index(drop=True)
 		self.label_to_idx = label_to_idx
+		self.augment = augment
 
 	def __len__(self) -> int:
 		return len(self.dataframe)
@@ -133,6 +139,16 @@ class CKExtendedDataset(Dataset):
 
 		# CK+ grayscale faces are flattened 48x48.
 		image = torch.tensor(pixels).view(1, 48, 48) / 255.0
+		if self.augment:
+			if torch.rand(1).item() < 0.5:
+				image = torch.flip(image, dims=[2])
+			if torch.rand(1).item() < 0.3:
+				image = image + torch.randn_like(image) * 0.02
+			if torch.rand(1).item() < 0.3:
+				shift_x = int(torch.randint(-2, 3, (1,)).item())
+				shift_y = int(torch.randint(-2, 3, (1,)).item())
+				image = torch.roll(image, shifts=(shift_y, shift_x), dims=(1, 2))
+			image = image.clamp(0.0, 1.0)
 		label_raw = int(row["emotion"])
 		label_value = self.label_to_idx[label_raw] if self.label_to_idx is not None else label_raw
 		label = torch.tensor(label_value, dtype=torch.long)
@@ -178,7 +194,7 @@ def dataloader(
 
 	if not train_df.empty:
 		loaders["train"] = DataLoader(
-			CKExtendedDataset(train_df, label_to_idx=label_to_idx),
+			CKExtendedDataset(train_df, label_to_idx=label_to_idx, augment=True),
 			batch_size=batch_size,
 			shuffle=True,
 			num_workers=num_workers,
@@ -392,13 +408,22 @@ def run(args: argparse.Namespace) -> None:
 	model = build_model(
 		num_classes=inferred_num_classes,
 		embedding_dim=args.embedding_dim,
+		dropout=args.dropout,
 	).to(device)
-	criterion = nn.CrossEntropyLoss()
+	criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 	optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+	scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+		optimizer,
+		mode="max",
+		factor=args.lr_factor,
+		patience=args.lr_patience,
+	)
 	prototypes = torch.zeros(inferred_num_classes, args.embedding_dim, device=device)
 	prototype_counts = torch.zeros(inferred_num_classes, dtype=torch.long, device=device)
 
 	best_val_acc = -1.0
+	best_epoch = 0
+	no_improve_epochs = 0
 	for epoch in range(1, args.epochs + 1):
 		if epoch < args.aux_start_epoch:
 			aux_scale = 0.0
@@ -426,24 +451,43 @@ def run(args: argparse.Namespace) -> None:
 
 		if "val" in loaders:
 			val_loss, val_acc = test(model, loaders["val"], criterion, device)
+			scheduler.step(val_acc)
+			current_lr = optimizer.param_groups[0]["lr"]
 			epoch_msg = (
 				f"Epoch {epoch:03d}/{args.epochs} | "
 				f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | "
-				f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+				f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | lr={current_lr:.6f}"
 			)
 			print(epoch_msg)
 			logger.info(epoch_msg)
-			if val_acc > best_val_acc:
+			if val_acc > (best_val_acc + args.min_delta):
 				best_val_acc = val_acc
+				best_epoch = epoch
+				no_improve_epochs = 0
 				torch.save(model.state_dict(), args.save)
 				logger.info("saved best model to %s | best_val_acc=%.4f", args.save, best_val_acc)
+			else:
+				no_improve_epochs += 1
+				if no_improve_epochs >= args.patience:
+					stop_msg = (
+						f"early stopping at epoch {epoch} | "
+						f"best_epoch={best_epoch} best_val_acc={best_val_acc:.4f}"
+					)
+					print(stop_msg)
+					logger.info(stop_msg)
+					break
 		else:
+			current_lr = optimizer.param_groups[0]["lr"]
 			epoch_msg = (
 				f"Epoch {epoch:03d}/{args.epochs} | "
-				f"train_loss={train_loss:.4f} train_acc={train_acc:.4f}"
+				f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} | lr={current_lr:.6f}"
 			)
 			print(epoch_msg)
 			logger.info(epoch_msg)
+
+	if "val" in loaders and os.path.exists(args.save):
+		model.load_state_dict(torch.load(args.save, map_location=device))
+		logger.info("loaded best checkpoint for evaluation | file=%s", args.save)
 
 	if "test" in loaders:
 		test_loss, test_acc = test(model, loaders["test"], criterion, device)
@@ -483,6 +527,8 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--num-workers", type=int, default=0)
 	parser.add_argument("--num-classes", type=int, default=7)
 	parser.add_argument("--embedding-dim", type=int, default=128)
+	parser.add_argument("--dropout", type=float, default=0.3)
+	parser.add_argument("--label-smoothing", type=float, default=0.05)
 	parser.add_argument("--proto-momentum", type=float, default=0.95)
 	parser.add_argument("--boundary-margin", type=float, default=0.15)
 	parser.add_argument("--push-scale", type=float, default=0.5)
@@ -490,6 +536,10 @@ def build_argparser() -> argparse.ArgumentParser:
 	parser.add_argument("--lambda-push", type=float, default=0.25)
 	parser.add_argument("--aux-start-epoch", type=int, default=4)
 	parser.add_argument("--aux-ramp-epochs", type=int, default=6)
+	parser.add_argument("--lr-factor", type=float, default=0.5)
+	parser.add_argument("--lr-patience", type=int, default=3)
+	parser.add_argument("--patience", type=int, default=8)
+	parser.add_argument("--min-delta", type=float, default=1e-3)
 	parser.add_argument("--print-confusion", action="store_true")
 	parser.add_argument("--print-multilabel-confusion", action="store_true")
 	parser.add_argument("--save", type=str, default="best_model.pt")
