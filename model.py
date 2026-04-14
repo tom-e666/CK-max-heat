@@ -105,6 +105,6 @@ class EmotionCNN(nn.Module):
 		return self.forward_from_embedding(embedding)
 
 
-def build_model(num_classes: int = 7, embedding_dim: int = 128) -> nn.Module:
+def build_model(num_classes: int = 7, embedding_dim: int = 128, dropout: float = 0.3) -> nn.Module:
 	"""Convenience factory for training scripts."""
-	return EmotionCNN(num_classes=num_classes, embedding_dim=embedding_dim)
+	return EmotionCNN(num_classes=num_classes, embedding_dim=embedding_dim, dropout=dropout)
